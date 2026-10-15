@@ -1,91 +1,117 @@
 import os
 import time
-import glob
-import telebot
-from yt_dlp import YoutubeDL
+import threading
 from flask import Flask
-from threading import Thread
+import telebot
+import yt_dlp
 
-# टेलीग्राम बॉट टोकन (Render Environment Variables से लेगा)
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Render के Environment Variable से बॉट टोकन लें
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Flask ऐप (Render को एक्टिव रखने के लिए पोर्ट बाइंडिंग)
-app = Flask('')
+# 1. Flask वेब सर्वर (Cron-job से बॉट को 24x7 जगाए रखने के लिए)
+app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is running perfectly!"
+    return "Instagram Reel Bot is Running Alive!", 200
 
-def run_flask():
-    # Render डिफ़ॉल्ट रूप से 10000 पोर्ट का उपयोग करता है
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
-# स्टार्ट कमांड
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "नमस्ते! मुझे किसी भी इंस्टाग्राम रील (Reels) का लिंक भेजें, मैं उसे कैप्शन के साथ डाउनलोड करके दूंगा।")
-
-# रील डाउनलोडर लॉजिक
-@bot.message_handler(func=lambda message: True)
-def download_reel(message):
-    url = message.text
+# 2. Instagram Reel डाउनलोड करने का फंक्शन
+def download_instagram_reel(url, unique_id):
+    output_template = f"reel_{unique_id}.%(ext)s"
     
-    # चेक करें कि लिंक इंस्टाग्राम का है या नहीं
-    if "instagram.com" not in url:
-        bot.reply_to(message, "कृपया केवल वैध इंस्टाग्राम रील (Instagram Reel) का लिंक भेजें।")
-        return
-
-    status_msg = bot.reply_to(message, "⏳ आपकी रील प्रोसेस हो रही है, कृपया प्रतीक्षा करें...")
-
-    # yt-dlp कॉन्फ़िगरेशन
     ydl_opts = {
-        'format': 'mp4',
-        'outtmpl': 'downloads/%(id)s.%(ext)s', # डाउनलोड फोल्डर में सेव होगा
+        'format': 'best[ext=mp4]/best',
+        'outtmpl': output_template,
         'quiet': True,
         'no_warnings': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     }
 
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            # वीडियो की जानकारी (जैसे कैप्शन) निकालना
-            info_dict = ydl.extract_info(url, download=True)
-            video_title = info_dict.get('description', info_dict.get('title', ''))
-            
-            # डाउनलोड की गई फाइल का पाथ खोजना
-            video_id = info_dict.get('id')
-            search_path = f"downloads/{video_id}.*"
-            files = glob.glob(search_path)
+    # अगर आपने ब्लॉक से बचने के लिए cookies.txt डाली है, तो यह अपने आप उसे इस्तेमाल करेगा
+    if os.path.exists("cookies.txt"):
+        ydl_opts['cookiefile'] = "cookies.txt"
 
-            if files:
-                filepath = files[0]
-                # वीडियो को कैप्शन के साथ भेजना
-                with open(filepath, 'rb') as video:
-                    bot.send_video(
-                        chat_id=message.chat.id, 
-                        video=video, 
-                        caption=video_title if video_title else "Downloaded via Bot",
-                        reply_to_message_id=message.message_id
-                    )
-                
-                # भेजने के बाद फाइल डिलीट करना ताकि सर्वर की मेमोरी न भरे
-                os.remove(filepath)
-                bot.delete_message(message.chat.id, status_msg.message_id)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        caption = info.get('description') or "कोई कैप्शन उपलब्ध नहीं है।"
+        return filename, caption
+
+# 3. Telegram कमांड और लिंक हैंडलर
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    bot.reply_to(
+        message, 
+        "नमस्ते! मुझे किसी भी Instagram Reel का लिंक भेजें, मैं आपको वीडियो और उसका पूरा कैप्शन भेज दूंगा।"
+    )
+
+@bot.message_handler(func=lambda message: True)
+def handle_reel_link(message):
+    url = message.text.strip()
+    
+    if "instagram.com/" not in url:
+        bot.reply_to(message, "कृपया एक सही Instagram Reel लिंक भेजें।")
+        return
+
+    status_msg = bot.reply_to(message, "⏳ रील डाउनलोड हो रही है, कृपया प्रतीक्षा करें...")
+    unique_id = f"{message.chat.id}_{message.message_id}"
+    video_path = None
+
+    try:
+        video_path, caption = download_instagram_reel(url, unique_id)
+
+        # टेलीग्राम वीडियो कैप्शन की लिमिट 1024 अक्षर होती है
+        # अगर कैप्शन छोटा है तो वीडियो के साथ भेजें, बड़ा है तो अलग मैसेज में भेजें
+        with open(video_path, 'rb') as video_file:
+            if len(caption) <= 1000:
+                bot.send_video(
+                    message.chat.id, 
+                    video_file, 
+                    caption=caption, 
+                    reply_to_message_id=message.message_id
+                )
             else:
-                bot.edit_message_text("❌ वीडियो फाइल नहीं मिल सकी। कृपया दोबारा प्रयास करें।", message.chat.id, status_msg.message_id)
+                bot.send_video(
+                    message.chat.id, 
+                    video_file, 
+                    caption="✅ लीजिए आपकी रील! (कैप्शन बड़ा होने के कारण नीचे अलग मैसेज में दिया गया है)",
+                    reply_to_message_id=message.message_id
+                )
+                # 4096 अक्षर की लिमिट के हिसाब से पूरा कैप्शन भेजें
+                bot.send_message(message.chat.id, caption[:4090], reply_to_message_id=message.message_id)
+
+        bot.delete_message(message.chat.id, status_msg.message_id)
 
     except Exception as e:
-        print(f"Error: {e}")
-        bot.edit_message_text("❌ डाउनलोड करने में कोई समस्या आई। लिंक सही है या नहीं, यह जांचें या बॉट को दोबारा रिस्टार्ट करें।", message.chat.id, status_msg.message_id)
+        bot.edit_message_text(
+            f"❌ डाउनलोड करने में समस्या आई। सुनिश्चित करें कि रील पब्लिक अकाउंट की है।\n\nतकनीकी कारण: {str(e)[:150]}",
+            chat_id=message.chat.id,
+            message_id=status_msg.message_id
+        )
+    
+    finally:
+        # सर्वर की मेमोरी फुल होने से बचाने के लिए फाइल तुरंत डिलीट करें
+        if video_path and os.path.exists(video_path):
+            try:
+                os.remove(video_path)
+            except Exception:
+                pass
 
-# बॉट और वेब सर्वर को एक साथ शुरू करना
+# 4. बॉट और सर्वर को एक साथ शुरू करें (ऑटो-रीस्टार्ट के साथ)
 if __name__ == "__main__":
-    # Flask को अलग थ्रेड में चलाएं ताकि Render का पोर्ट चालू रहे
-    t = Thread(target=run_flask)
-    t.start()
+    # बैकग्राउंड में Flask वेब सर्वर चलाएं
+    server_thread = threading.Thread(target=run_web_server)
+    server_thread.daemon = True
+    server_thread.start()
+
+    # पुराने वेबहुक हटाएं ताकि 409 Conflict एरर न आए
+    bot.remove_webhook()
+    time.sleep(1)
     
     print("Bot is polling...")
-    # एरर आने पर बॉट बंद न हो, इसलिए infinity_polling का उपयोग किया है
-    bot.infinity_polling(timeout=10, long_polling_timeout=5)
-          
+    bot.infinity_polling(timeout=20, long_polling_timeout=10)
